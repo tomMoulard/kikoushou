@@ -34,7 +34,9 @@ import { ErrorDisplay } from '@/components/shared/ErrorDisplay';
 import { LoadingState } from '@/components/shared/LoadingState';
 import { PageHeader } from '@/components/shared/PageHeader';
 import { AccountSection } from '@/features/auth/components/AccountSection';
+import { NotificationSettings } from '@/features/settings/components/NotificationSettings';
 import { ThemeSelector } from '@/features/settings/components/ThemeSelector';
+import { TripIdentitySelector } from '@/features/settings/components/TripIdentitySelector';
 import { TripForm } from '@/features/trips/components/TripForm';
 import { useTripContext } from '@/contexts/TripContext';
 import { db } from '@/lib/db';
@@ -483,9 +485,11 @@ const CurrentTripSection = memo(function CurrentTripSection(): ReactElement {
  *
  * Features:
  * - Current trip: edit or delete, with loading, error and empty states
+ * - Identity: which guest of the current trip this device belongs to
  * - Account: sign in with Google, sign out
  * - Language selector (French/English)
  * - Theme selector (light/dark/system)
+ * - Ride alerts: opt in to OS notifications for the cars you drive
  * - App version display
  * - Clear data option with confirmation
  * - About section
@@ -515,6 +519,11 @@ function SettingsPageComponent(): ReactElement {
         {/* Current Trip Section — carries its own loading, error and empty states */}
         <CurrentTripSection />
 
+        {/* Who is holding this device, on the current trip — the transport
+            views filter by it, so it sits directly under the trip it answers
+            for rather than among the presentation preferences below. */}
+        <TripIdentitySelector />
+
         {/* Account Section */}
         <AccountCard />
 
@@ -523,6 +532,11 @@ function SettingsPageComponent(): ReactElement {
 
         {/* Theme Section - grouped with Language: both are presentation preferences */}
         <ThemeSelector />
+
+        {/* Ride alerts — below the presentation preferences because it is the
+            only card here that asks the browser for something, and above About
+            because it is a preference rather than reference material. */}
+        <NotificationSettings />
 
         {/* About Section */}
         <AboutSection />

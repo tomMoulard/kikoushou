@@ -14,7 +14,7 @@
 
 import { format } from 'date-fns';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { render, screen } from '@/test/utils';
+import { render, screen, userEvent, within } from '@/test/utils';
 import type { Person, Transport, Trip } from '@/types';
 
 // ============================================================================
@@ -77,6 +77,29 @@ const mockPerson: Person = {
   color: '#3b82f6' as Person['color'],
 };
 
+/** The guest at the wheel, for the journeys that have one. */
+const mockDriver: Person = {
+  id: 'person-2' as Person['id'],
+  tripId: 'trip-1' as Person['tripId'],
+  name: 'Bob',
+  color: '#ef4444' as Person['color'],
+};
+
+/** Two more passengers, so a shared car holds three people rather than one. */
+const mockCarol: Person = {
+  id: 'person-3' as Person['id'],
+  tripId: 'trip-1' as Person['tripId'],
+  name: 'Carol',
+  color: '#22c55e' as Person['color'],
+};
+
+const mockDave: Person = {
+  id: 'person-4' as Person['id'],
+  tripId: 'trip-1' as Person['tripId'],
+  name: 'Dave',
+  color: '#a855f7' as Person['color'],
+};
+
 const mockArrival: Transport = {
   id: 'transport-1' as Transport['id'],
   tripId: 'trip-1' as Transport['tripId'],
@@ -108,6 +131,17 @@ vi.mock('@/contexts/TripContext', () => ({
   })),
 }));
 
+// Same reason as the panel: a driven ride covers its legs, so the page's alert
+// gate reads the rides as well as the legs. The list draws those rides too, so
+// it takes the cars along with them.
+vi.mock('@/contexts/RideContext', () => ({
+  // `vehicles` is read too now: the scope filter resolves the trip's cars to
+  // decide which legs concern the guest holding the device. `isLoading` counts
+  // towards the page's own loading state, because a paint taken with no rides
+  // yet contradicts itself about who needs a driver.
+  useRideContext: vi.fn(() => ({ rides: [], vehicles: [], isLoading: false })),
+}));
+
 vi.mock('@/contexts/PersonContext', () => ({
   usePersonContext: vi.fn(() => ({
     persons: [mockPerson],
@@ -134,6 +168,12 @@ vi.mock('@/hooks', () => ({
     successToast: vi.fn(),
     errorToast: vi.fn(),
   }),
+  // Defaulted to "nobody has said who they are" in `resetMocks`, which is the
+  // state every other assertion in this file was written against: the scope
+  // filter shows everything and offers the hint instead of the switch. The
+  // filter's own behaviour is covered in
+  // features/transports/components/__tests__/TransportScopeFilter.test.tsx.
+  useTripIdentity: vi.fn(),
 }));
 
 // Mock child components
@@ -145,16 +185,54 @@ vi.mock('@/features/transports/components/UpcomingPickups', () => ({
   UpcomingPickups: () => <div data-testid="upcoming-pickups" />,
 }));
 
+// The ride dialog reports whether the page opened it, and in which mode: a
+// create action must not arrive carrying the id of whatever was edited last.
+vi.mock('@/features/transports/components/RideDialog', () => ({
+  RideDialog: ({ open, rideId }: { open: boolean; rideId?: string }) =>
+    open ? <div data-testid="ride-dialog" data-ride-id={rideId ?? ''} /> : null,
+}));
+
+// The change feed resolves who is holding the device, which reaches
+// `AuthContext` and Dexie — neither of which this page's own tests provide.
+// It has its own tests; here it only has to exist.
+vi.mock('@/features/transports/components/RideChangeFeed', () => ({
+  RideChangeFeed: () => <div data-testid="ride-change-feed" />,
+}));
+
+// The driver's departure banner is stubbed for the same reason. It reads the
+// identity hook and the whole transport list, neither of which this file's
+// mocks supply.
+vi.mock('@/features/transports/components/DriverAlert', () => ({
+  DriverAlert: () => <div data-testid="driver-alert" />,
+}));
+
 import { TransportListPage } from '../TransportListPage';
+import { useTripIdentity } from '@/hooks';
 import { useTripContext } from '@/contexts/TripContext';
 import { useTransportContext } from '@/contexts/TransportContext';
 import { usePersonContext } from '@/contexts/PersonContext';
+import { useRideContext } from '@/contexts/RideContext';
 
 // ============================================================================
 // Helpers
 // ============================================================================
 
+/**
+ * Sets which guest this device is.
+ *
+ * @param myPersonId - The identified guest, or undefined for an unidentified device
+ */
+function mockIdentity(myPersonId: Person['id'] | undefined): void {
+  vi.mocked(useTripIdentity).mockReturnValue({
+    myPersonId,
+    source: myPersonId === undefined ? undefined : 'explicit',
+    isResolved: true,
+    setMyPersonId: vi.fn(),
+  });
+}
+
 function resetMocks() {
+  mockIdentity(undefined);
   vi.mocked(useTripContext).mockReturnValue({
     currentTrip: mockTrip,
     isLoading: false,
@@ -178,6 +256,12 @@ function resetMocks() {
     error: null,
     deleteTransport: vi.fn().mockResolvedValue(undefined),
   } as unknown as ReturnType<typeof useTransportContext>);
+  // `clearAllMocks` clears calls, not implementations, so a test that hands the
+  // page a ride would otherwise hand it to every test after it too.
+  vi.mocked(useRideContext).mockReturnValue({
+    rides: [],
+    vehicles: [],
+  } as unknown as ReturnType<typeof useRideContext>);
 }
 
 // ============================================================================
@@ -260,9 +344,27 @@ describe('TransportListPage', () => {
     expect(screen.getByText('transports.empty')).toBeInTheDocument();
   });
 
+  it('says the filter is empty, not the trip, when "mine" hides everything', () => {
+    // A guest with no leg of their own on a trip that is fully planned. "No
+    // travel plans yet" would be false here, and false in the direction that
+    // reads as data loss.
+    mockIdentity('person-2' as Person['id']);
+
+    render(<TransportListPage />, { withProviders: false });
+
+    expect(screen.getByText('transports.scope.empty')).toBeInTheDocument();
+    expect(screen.queryByText('transports.empty')).not.toBeInTheDocument();
+    // And the way back is on screen rather than in the URL bar.
+    expect(
+      screen.getByRole('button', { name: 'transports.scope.showAll' }),
+    ).toBeInTheDocument();
+  });
+
   it('renders back link', () => {
     render(<TransportListPage />, { withProviders: false });
-    const backLink = screen.getByRole('link');
+    // Named, not "the only link on the page": the scope filter adds one of its
+    // own pointing at Settings when nobody has said who they are.
+    const backLink = screen.getByRole('link', { name: 'common.back' });
     expect(backLink).toBeInTheDocument();
   });
 
@@ -327,25 +429,19 @@ describe('TransportListPage', () => {
     expect(screen.queryByText(/transports\.driver/)).not.toBeInTheDocument();
   });
 
-  it('renders transport with driver when pickup has driver', () => {
-    const driverPerson: Person = {
-      id: 'person-2' as Person['id'],
-      tripId: 'trip-1' as Person['tripId'],
-      name: 'Bob',
-      color: '#ef4444' as Person['color'],
-    };
+  it('renders a legacy driver-only transport as a one-passenger ride card', () => {
     const pickupTransport: Transport = {
       ...mockArrival,
       needsPickup: true,
       driverId: 'person-2' as Transport['driverId'],
     };
     vi.mocked(usePersonContext).mockReturnValue({
-      persons: [mockPerson, driverPerson],
+      persons: [mockPerson, mockDriver],
       isLoading: false,
       error: null,
       getPersonById: vi.fn((id: string) => {
         if (id === 'person-1') return mockPerson;
-        if (id === 'person-2') return driverPerson;
+        if (id === 'person-2') return mockDriver;
         return undefined;
       }),
     } as unknown as ReturnType<typeof usePersonContext>);
@@ -360,11 +456,77 @@ describe('TransportListPage', () => {
     } as unknown as ReturnType<typeof useTransportContext>);
     render(<TransportListPage />, { withProviders: false });
 
-    // Once somebody is driving, the card names them in a resolved-pickup badge
-    // and stops asking for a driver — the whole difference between this test
-    // and the one above it, which the shared `getByText('Alice')` could not see
-    expect(screen.getByText('transports.driver: Bob')).toBeInTheDocument();
+    // Nothing migrates the old shape, so `resolveRides` reads it as a journey
+    // of one and the list draws it as a ride — which is what makes the driver
+    // and the passenger appear together instead of on unrelated rows.
+    const card = screen.getByRole('article');
+    expect(within(card).getByText('rides.driver:')).toBeInTheDocument();
+    expect(within(card).getByText('Bob')).toBeInTheDocument();
+    expect(within(card).getByText('Alice')).toBeInTheDocument();
+    // The old pickup plea belongs to the leg card, which this row is not.
     expect(screen.queryByText('transports.needsPickup')).not.toBeInTheDocument();
+  });
+
+  it('folds three legs sharing a car into a single ride card', () => {
+    const meetDatetime = daysFromNow(7, 14, 30);
+    const ride = {
+      id: 'ride-1',
+      tripId: 'trip-1',
+      direction: 'pickup',
+      meetDatetime,
+      location: 'Paris CDG',
+      leadTimeMinutes: 30,
+      driverId: 'person-2',
+      vehicleId: 'vehicle-1',
+    };
+    const legs: Transport[] = [
+      { ...mockArrival, id: 't-a' as Transport['id'], rideId: 'ride-1' as Transport['rideId'] },
+      {
+        ...mockArrival,
+        id: 't-b' as Transport['id'],
+        personId: 'person-3' as Transport['personId'],
+        datetime: daysFromNow(7, 14, 45) as Transport['datetime'],
+        rideId: 'ride-1' as Transport['rideId'],
+      },
+      {
+        ...mockArrival,
+        id: 't-c' as Transport['id'],
+        personId: 'person-4' as Transport['personId'],
+        datetime: daysFromNow(7, 15, 0) as Transport['datetime'],
+        rideId: 'ride-1' as Transport['rideId'],
+      },
+    ];
+    vi.mocked(usePersonContext).mockReturnValue({
+      persons: [mockPerson, mockDriver, mockCarol, mockDave],
+      isLoading: false,
+      error: null,
+      getPersonById: vi.fn(),
+    } as unknown as ReturnType<typeof usePersonContext>);
+    vi.mocked(useRideContext).mockReturnValue({
+      rides: [ride],
+      vehicles: [{ id: 'vehicle-1', tripId: 'trip-1', name: 'Rented Espace', seatCount: 7 }],
+    } as unknown as ReturnType<typeof useRideContext>);
+    vi.mocked(useTransportContext).mockReturnValue({
+      arrivals: legs,
+      departures: [],
+      upcomingPickups: [],
+      nowMs: Date.now(),
+      isLoading: false,
+      error: null,
+      deleteTransport: vi.fn().mockResolvedValue(undefined),
+    } as unknown as ReturnType<typeof useTransportContext>);
+    render(<TransportListPage />, { withProviders: false });
+
+    // One card for the car, not three unrelated rows for the three people in it
+    const cards = screen.getAllByRole('article');
+    expect(cards).toHaveLength(1);
+
+    const card = cards[0] as HTMLElement;
+    expect(within(card).getByText('Alice')).toBeInTheDocument();
+    expect(within(card).getByText('Carol')).toBeInTheDocument();
+    expect(within(card).getByText('Dave')).toBeInTheDocument();
+    expect(within(card).getByText('Bob')).toBeInTheDocument();
+    expect(within(card).getByText('Rented Espace')).toBeInTheDocument();
   });
 
   it('renders transport with transport number', () => {
@@ -539,25 +701,19 @@ describe('TransportListPage', () => {
     expect(screen.getByText('Meet at gate 12')).toBeInTheDocument();
   });
 
-  it('renders driver without needsPickup', () => {
-    const driverPerson: Person = {
-      id: 'person-2' as Person['id'],
-      tripId: 'trip-1' as Person['tripId'],
-      name: 'Bob',
-      color: '#ef4444' as Person['color'],
-    };
+  it('renders a driven departure as a ride card', () => {
     const transportWithDriver: Transport = {
       ...mockArrival,
       needsPickup: false,
       driverId: 'person-2' as Transport['driverId'],
     };
     vi.mocked(usePersonContext).mockReturnValue({
-      persons: [mockPerson, driverPerson],
+      persons: [mockPerson, mockDriver],
       isLoading: false,
       error: null,
       getPersonById: vi.fn((id: string) => {
         if (id === 'person-1') return mockPerson;
-        if (id === 'person-2') return driverPerson;
+        if (id === 'person-2') return mockDriver;
         return undefined;
       }),
     } as unknown as ReturnType<typeof usePersonContext>);
@@ -571,8 +727,11 @@ describe('TransportListPage', () => {
       deleteTransport: vi.fn().mockResolvedValue(undefined),
     } as unknown as ReturnType<typeof useTransportContext>);
     render(<TransportListPage />, { withProviders: false });
-    // Driver section should show with driver name
-    expect(screen.getByText(/transports\.driver/)).toBeInTheDocument();
+
+    // Somebody driving is a journey whether or not the leg asked for a pickup
+    expect(screen.getByText('rides.driver:')).toBeInTheDocument();
+    expect(screen.getByText('Bob')).toBeInTheDocument();
+    expect(screen.queryByText(/transports\.driver/)).not.toBeInTheDocument();
   });
 
   it('renders transport with mode only (no number)', () => {
@@ -721,5 +880,39 @@ describe('TransportListPage', () => {
     } as unknown as ReturnType<typeof useTransportContext>);
     render(<TransportListPage />, { withProviders: false });
     expect(screen.getByText('transports.needsPickup')).toBeInTheDocument();
+  });
+
+  // ==========================================================================
+  // Cars and Rides
+  // ==========================================================================
+
+  describe('the cars and rides actions', () => {
+    it('sends the Cars button to the sub-page under transports', async () => {
+      const user = userEvent.setup();
+
+      render(<TransportListPage />, { withProviders: false });
+
+      await user.click(screen.getByRole('button', { name: 'vehicles.title' }));
+
+      // Under `transports`, not beside it. The cars are deliberately out of the
+      // main navigation, so this button is the only way in and the path it uses
+      // is the one the router registers.
+      expect(mockNavigate).toHaveBeenCalledWith('/trips/trip-1/transports/vehicles');
+    });
+
+    it('opens the ride dialog in create mode', async () => {
+      const user = userEvent.setup();
+
+      render(<TransportListPage />, { withProviders: false });
+
+      expect(screen.queryByTestId('ride-dialog')).not.toBeInTheDocument();
+
+      await user.click(screen.getByRole('button', { name: 'rides.new' }));
+
+      // Create mode carries no id. A dialog handed a stale one would open the
+      // last ride somebody edited and save over it.
+      const dialog = screen.getByTestId('ride-dialog');
+      expect(dialog).toHaveAttribute('data-ride-id', '');
+    });
   });
 });

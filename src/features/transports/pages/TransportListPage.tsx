@@ -4,6 +4,21 @@
  *
  * Route: /trips/:tripId/transports
  *
+ * The list has two kinds of row, and only two:
+ *
+ * - **A car journey** (`RideCard`), with the legs riding in it nested inside
+ *   it. Three guests landing at the same terminal within the hour used to be
+ *   three unrelated cards that never mentioned one another, so the driver had
+ *   to reconstruct the car in their head.
+ * - **A leg travelling on its own** (`TransportCard`) — a transport with no
+ *   ride and nobody driving it, rendered exactly as it always was.
+ *
+ * Which is which is decided by `resolveRides`, never here: the card, the
+ * calendar, the map and the "time to leave" notification all read that one
+ * function so they cannot disagree about the same car. A legacy `driverId`-only
+ * transport therefore arrives as a one-passenger journey — nothing migrates
+ * those rows, and the read is where the two storage shapes converge.
+ *
  * Features:
  * - Single chronological list (no tabs)
  * - Date grouping with date headers
@@ -12,6 +27,7 @@
  * - Edit/delete actions via dropdown menu
  * - Add transport action (FAB on mobile, header button on desktop)
  * - Empty state when no transports
+ * - "Only mine" / "Everyone" scope filter, persisted in `?scope=`
  * - Responsive design
  *
  * @module features/transports/pages/TransportListPage
@@ -35,6 +51,7 @@ import { type Locale, format, parseISO } from 'date-fns';
 import {
   ArrowDownToLine,
   ArrowUpFromLine,
+  CarFront,
   ChevronDown,
   ChevronRight,
   Clock,
@@ -51,6 +68,7 @@ import {
 
 import { useTripContext } from '@/contexts/TripContext';
 import { usePersonContext } from '@/contexts/PersonContext';
+import { useRideContext } from '@/contexts/RideContext';
 import { useTransportContext } from '@/contexts/TransportContext';
 import { PageHeader } from '@/components/shared/PageHeader';
 import { EmptyState } from '@/components/shared/EmptyState';
@@ -77,14 +95,38 @@ import { cn } from '@/lib/utils';
 import { formatFullDate } from '@/lib/utils/date-format';
 import { formatTransportDatetimeParts } from '@/lib/utils/datetime-format';
 import { getTransportModeIcon } from '@/lib/utils/transport-icons';
-import { TransportDialog } from '@/features/transports/components/TransportDialog';
-import { UpcomingPickups } from '@/features/transports/components/UpcomingPickups';
+import { DriverAlert } from '@/features/transports/components/DriverAlert';
 import {
+  createHeadcountResolver,
+  type HeadcountResolver,
+} from '@/features/rooms/utils/capacity-utils';
+import { RideCard } from '@/features/transports/components/RideCard';
+import { RideDialog } from '@/features/transports/components/RideDialog';
+import { RideChangeFeed } from '@/features/transports/components/RideChangeFeed';
+import { TransportDialog } from '@/features/transports/components/TransportDialog';
+import { TransportScopeFilter } from '@/features/transports/components/TransportScopeFilter';
+import { UpcomingPickups } from '@/features/transports/components/UpcomingPickups';
+import { useTransportScope } from '@/features/transports/hooks/useTransportScope';
+import {
+  collectDrivenRideIds,
+  isLegCovered,
   isTransportUpcoming,
   selectPickupsNeedingDriver,
-  sortTransportsByInstant,
+  toTransportInstant,
 } from '@/features/transports/utils/pickup-utils';
-import type { Person, PersonId, Transport, TransportId, TransportType } from '@/types';
+import {
+  type ResolvedRide,
+  resolveRides,
+  rideConcernsPerson,
+} from '@/features/transports/utils/ride-model';
+import type {
+  Person,
+  PersonId,
+  RideId,
+  Transport,
+  TransportId,
+  TransportType,
+} from '@/types';
 
 // ============================================================================
 // Type Definitions
@@ -110,29 +152,62 @@ interface TransportCardProps {
   readonly isActionsDisabled?: boolean;
   /** Whether this transport is in the past */
   readonly isPast?: boolean;
+  /**
+   * The rides somebody has volunteered to drive, from `collectDrivenRideIds`.
+   *
+   * Passed in rather than read here so the badge and the page's amber alert
+   * gate answer "is anybody driving this leg" from one index and one
+   * definition. They briefly did not, and the page contradicted itself: the
+   * panel vanished once Guillaume volunteered on the ride while Alice's own
+   * card went on saying nobody was collecting her.
+   */
+  readonly drivenRideIds: ReadonlySet<string>;
 }
 
 /**
- * A group of transports for a single date.
+ * One row of the list.
+ *
+ * A journey and a lone leg are different shapes with different cards, so the
+ * list carries the discriminated union rather than two parallel arrays — the
+ * two have to interleave chronologically inside a day.
+ */
+type TransportListEntry =
+  | {
+      readonly kind: 'ride';
+      /** React key: the journey's id, which a legacy journey borrows from its leg. */
+      readonly key: string;
+      /** The instant this row is filed and sorted under — the meeting time. */
+      readonly datetime: string;
+      readonly journey: ResolvedRide;
+    }
+  | {
+      readonly kind: 'leg';
+      readonly key: string;
+      readonly datetime: string;
+      readonly transport: Transport;
+    };
+
+/**
+ * A group of list entries for a single date.
  */
 interface DateGroup {
   /** Date key (YYYY-MM-DD format) */
   readonly dateKey: string;
   /** Formatted date for display */
   readonly displayDate: string;
-  /** Transports for this date, sorted by time */
-  readonly transports: readonly Transport[];
+  /** Entries for this date, sorted by time */
+  readonly entries: readonly TransportListEntry[];
 }
 
 /**
  * Props for the TransportList component.
  */
 interface TransportListProps {
-  /** Array of date groups for upcoming transports */
+  /** Array of date groups for upcoming entries */
   readonly upcomingDateGroups: readonly DateGroup[];
-  /** Array of date groups for past transports */
+  /** Array of date groups for past entries */
   readonly pastDateGroups: readonly DateGroup[];
-  /** Total count of past transports */
+  /** Total count of past entries — cards, not legs */
   readonly pastCount: number;
   /** Map of person ID to Person object */
   readonly personsMap: Map<PersonId, Person>;
@@ -150,6 +225,16 @@ interface TransportListProps {
   readonly emptyDescription: string;
   /** Whether actions are disabled */
   readonly isActionsDisabled?: boolean;
+  /** The rides somebody is driving, from `collectDrivenRideIds`. */
+  readonly drivenRideIds: ReadonlySet<string>;
+  /** How many people a guest row stands for — never assume one. */
+  readonly resolveHeadcount: HeadcountResolver;
+  /** The guest holding this device, so a car knows whose call it is. */
+  readonly myPersonId: PersonId | undefined;
+  /** Opens one car journey for editing. */
+  readonly onEditRide: (rideId: RideId) => void;
+  /** Asks to cancel one car journey. */
+  readonly onDeleteRide: (rideId: RideId) => void;
 }
 
 // ============================================================================
@@ -173,44 +258,126 @@ function getDateKey(datetime: string): string {
 }
 
 /**
- * Groups transports by date, sorted chronologically.
+ * Orders list entries chronologically by instant.
  *
- * @param transports - Array of transports to group
- * @param locale - date-fns locale for date formatting
- * @returns Array of date groups, each containing transports for that date
+ * Sorting by the raw string mis-orders mixed-offset values — see
+ * `toTransportInstant`. An entry whose datetime cannot be parsed sorts last,
+ * and ties break on the key so the order does not wobble between renders.
+ *
+ * @param entries - Entries to order (not mutated)
+ * @returns A new array sorted earliest first
  */
-function groupTransportsByDate(
-  transports: readonly Transport[],
+function sortEntriesByInstant(
+  entries: readonly TransportListEntry[],
+): TransportListEntry[] {
+  return [...entries].sort((a, b) => {
+    const left = toTransportInstant(a.datetime),
+      right = toTransportInstant(b.datetime);
+
+    if (left === null) {
+      return right === null ? a.key.localeCompare(b.key) : 1;
+    }
+    if (right === null) {
+      return -1;
+    }
+    return left === right ? a.key.localeCompare(b.key) : left - right;
+  });
+}
+
+/**
+ * Groups list entries by date, sorted chronologically.
+ *
+ * @param entries - Entries to group
+ * @param locale - date-fns locale for date formatting
+ * @returns Array of date groups, each containing the entries for that date
+ */
+function groupEntriesByDate(
+  entries: readonly TransportListEntry[],
   locale: Locale,
 ): DateGroup[] {
-  // Create a map of date key to transports
-  const groupsMap = new Map<string, Transport[]>();
-  
-  for (const transport of transports) {
-    const dateKey = getDateKey(transport.datetime);
+  // Create a map of date key to entries
+  const groupsMap = new Map<string, TransportListEntry[]>();
+
+  for (const entry of entries) {
+    const dateKey = getDateKey(entry.datetime);
     if (!dateKey) {continue;}
-    
+
     const existing = groupsMap.get(dateKey);
     if (existing) {
-      existing.push(transport);
+      existing.push(entry);
     } else {
-      groupsMap.set(dateKey, [transport]);
+      groupsMap.set(dateKey, [entry]);
     }
   }
-  
+
   // Convert to array and sort by date key (chronological). Date keys are all
-  // `yyyy-MM-dd`, so comparing them as strings is sound; the transports inside a
+  // `yyyy-MM-dd`, so comparing them as strings is sound; the entries inside a
   // day are ordered by instant, because their datetimes may carry different UTC
   // offsets and would then sort by wall clock rather than by when they happen.
   const groups: DateGroup[] = Array.from(groupsMap.entries())
     .sort(([a], [b]) => a.localeCompare(b))
-    .map(([dateKey, transports]) => ({
+    .map(([dateKey, dayEntries]) => ({
       dateKey,
       displayDate: formatFullDate(dateKey, locale),
-      transports: sortTransportsByInstant(transports),
+      entries: sortEntriesByInstant(dayEntries),
     }));
-  
+
   return groups;
+}
+
+/**
+ * Splits a trip's transports into the rows the list draws.
+ *
+ * The partition is `resolveRides`' own: every leg it places in a journey is
+ * covered by that journey's card, and what is left is a leg travelling alone —
+ * no ride, nobody driving. Re-deriving that split here (say, by testing
+ * `transport.rideId`) is exactly how a leg ends up rendered twice, or not at
+ * all: a `rideId` naming a ride this device does not yet hold is not membership,
+ * and `resolveRides` is the only place that knows it.
+ *
+ * @param journeys - The resolved journeys, already ordered by meeting time
+ * @param transports - Every transport of the trip
+ * @returns One entry per card, in no particular order (the grouping sorts them)
+ */
+function buildListEntries(
+  journeys: readonly ResolvedRide[],
+  transports: readonly Transport[],
+): TransportListEntry[] {
+  const covered = new Set<TransportId>(),
+    entries: TransportListEntry[] = [];
+
+  for (const journey of journeys) {
+    for (const leg of journey.legs) {
+      covered.add(leg.transport.id);
+    }
+    entries.push({
+      kind: 'ride',
+      key: journey.id,
+      // A journey is filed under its meeting time — except when that time
+      // cannot be placed at all, in which case the earliest leg's own datetime
+      // stands in. Without the fallback a single unreadable `meetDatetime`
+      // would drop the card out of every date group and take three perfectly
+      // valid arrivals off the page with it.
+      datetime:
+        journey.meetAtMs === null
+          ? (journey.legs[0]?.transport.datetime ?? journey.meetDatetime)
+          : journey.meetDatetime,
+      journey,
+    });
+  }
+
+  for (const transport of transports) {
+    if (!covered.has(transport.id)) {
+      entries.push({
+        kind: 'leg',
+        key: transport.id,
+        datetime: transport.datetime,
+        transport,
+      });
+    }
+  }
+
+  return entries;
 }
 
 // ============================================================================
@@ -229,6 +396,7 @@ const TransportCard = memo(function TransportCard({
   dateLocale,
   isActionsDisabled = false,
   isPast = false,
+  drivenRideIds,
 }: TransportCardProps): ReactElement {
   const { t } = useTranslation(),
 
@@ -268,8 +436,18 @@ const TransportCard = memo(function TransportCard({
     [handleEdit],
   ),
 
-  // Smart pickup logic: show "needs pickup" only when needsPickup=true AND no driver assigned
-   showNeedsPickupBadge = transport.needsPickup && !transport.driverId,
+  // "Needs pickup" only while nobody is driving it — which since rides exist
+  // means no legacy driver *and* no driven ride. `isLegCovered` is the single
+  // definition, shared with the page's alert gate and the map popup.
+   showNeedsPickupBadge =
+    transport.needsPickup && !isLegCovered(transport, drivenRideIds),
+
+  // The traveller driving their own leg. `resolveRides()` derives the same
+  // thing for a real ride and calls it `isSelfDriven`; this is the legacy
+  // shape of it, and the share wizard writes exactly that when a guest says
+  // they will have a car of their own. Named as a driver, Alice would appear
+  // on her own card as the person collecting Alice.
+   isSelfDriven = driver !== undefined && driver.id === transport.personId,
 
   // Build aria-label for accessibility
    ariaLabel = useMemo(() => {
@@ -283,11 +461,13 @@ const TransportCard = memo(function TransportCard({
     if (showNeedsPickupBadge) {
       parts.push(t('transports.needsPickup'));
     }
-    if (driver) {
+    if (isSelfDriven) {
+      parts.push(t('rides.selfDriven'));
+    } else if (driver) {
       parts.push(`${t('transports.driver')}: ${driver.name}`);
     }
     return parts.filter(Boolean).join(', ');
-  }, [transport, person, driver, date, time, t, showNeedsPickupBadge]);
+  }, [transport, person, driver, date, time, t, showNeedsPickupBadge, isSelfDriven]);
 
   return (
     <Card
@@ -330,8 +510,10 @@ const TransportCard = memo(function TransportCard({
                 {t('transports.needsPickup')}
               </Badge>
             )}
-            {/* Show driver badge when driver is assigned (pickup resolved) */}
-            {driver && transport.needsPickup && (
+            {/* Show driver badge when driver is assigned (pickup resolved) —
+                unless the driver is the traveller, which is not a pickup being
+                resolved but somebody getting themselves there. */}
+            {driver && !isSelfDriven && transport.needsPickup && (
               <Badge
                 variant="outline"
                 className={cn('shrink-0', statusVariants({ tone: 'success' }))}
@@ -402,8 +584,16 @@ const TransportCard = memo(function TransportCard({
           </div>
         )}
 
+        {/* Somebody is driving this leg, and it is the traveller themselves. */}
+        {isSelfDriven && (
+          <div className="flex items-center gap-2 text-sm text-muted-foreground">
+            <User className="size-4 shrink-0" aria-hidden="true" />
+            <span>{t('rides.selfDriven')}</span>
+          </div>
+        )}
+
         {/* Driver - only show in content if not already shown in badge (badge shown when needsPickup is true) */}
-        {driver && !transport.needsPickup && (
+        {driver && !isSelfDriven && !transport.needsPickup && (
           <div className="flex items-center gap-2 text-sm text-muted-foreground">
             <User className="size-4 shrink-0" aria-hidden="true" />
             <span>{t('transports.driver')}:</span>
@@ -442,8 +632,18 @@ interface DateGroupSectionProps {
   readonly dateLocale: Locale;
   /** Whether actions are disabled */
   readonly isActionsDisabled?: boolean;
-  /** Whether transports in this group are past */
+  /** Whether the entries in this group are past */
   readonly isPast?: boolean;
+  /** The rides somebody is driving, from `collectDrivenRideIds`. */
+  readonly drivenRideIds: ReadonlySet<string>;
+  /** How many people a guest row stands for — never assume one. */
+  readonly resolveHeadcount: HeadcountResolver;
+  /** The guest holding this device, so a car knows whose call it is. */
+  readonly myPersonId: PersonId | undefined;
+  /** Opens one car journey for editing. */
+  readonly onEditRide: (rideId: RideId) => void;
+  /** Asks to cancel one car journey. */
+  readonly onDeleteRide: (rideId: RideId) => void;
 }
 
 /**
@@ -457,6 +657,11 @@ const DateGroupSection = memo(function DateGroupSection({
   dateLocale,
   isActionsDisabled = false,
   isPast = false,
+  drivenRideIds,
+  resolveHeadcount,
+  myPersonId,
+  onEditRide,
+  onDeleteRide,
 }: DateGroupSectionProps): ReactElement {
   return (
     <section key={group.dateKey} aria-labelledby={`date-header-${group.dateKey}`}>
@@ -478,14 +683,42 @@ const DateGroupSection = memo(function DateGroupSection({
         'grid-cols-1 sm:grid-cols-2 lg:grid-cols-3',
       )}
     >
-      {group.transports.map((transport) => {
-        const person = personsMap.get(transport.personId),
+      {group.entries.map((entry) => {
+        if (entry.kind === 'ride') {
+          return (
+            <div key={entry.key} role="listitem">
+              <RideCard
+                journey={entry.journey}
+                dateLocale={dateLocale}
+                drivenRideIds={drivenRideIds}
+                resolveHeadcount={resolveHeadcount}
+                canResolveMismatch={
+                  myPersonId !== undefined && entry.journey.driverId === myPersonId
+                }
+                onEditRide={onEditRide}
+                onDeleteRide={onDeleteRide}
+                onEditLeg={onEdit}
+                onDeleteLeg={onDelete}
+                isActionsDisabled={isActionsDisabled}
+                isPast={isPast}
+              />
+            </div>
+          );
+        }
+
+        // A leg reaching this branch has nobody driving it — `resolveRides`
+        // took every driven one into a journey above — so this card's driver
+        // and its `isLegCovered` badge both answer "nobody" today. Both are
+        // still asked rather than assumed, so the card degrades honestly if
+        // that partition ever widens.
+        const { transport } = entry,
+         person = personsMap.get(transport.personId),
          driver = transport.driverId
           ? personsMap.get(transport.driverId)
           : undefined;
 
         return (
-          <div key={transport.id} role="listitem">
+          <div key={entry.key} role="listitem">
             <TransportCard
               transport={transport}
               person={person}
@@ -495,6 +728,7 @@ const DateGroupSection = memo(function DateGroupSection({
               dateLocale={dateLocale}
               isActionsDisabled={isActionsDisabled}
               isPast={isPast}
+              drivenRideIds={drivenRideIds}
             />
           </div>
         );
@@ -524,6 +758,11 @@ const TransportList = memo(function TransportList({
   emptyTitle,
   emptyDescription,
   isActionsDisabled = false,
+  drivenRideIds,
+  resolveHeadcount,
+  myPersonId,
+  onEditRide,
+  onDeleteRide,
 }: TransportListProps): ReactElement {
   const { t } = useTranslation();
   
@@ -566,6 +805,11 @@ const TransportList = memo(function TransportList({
           dateLocale={dateLocale}
           isActionsDisabled={isActionsDisabled}
           isPast={false}
+          drivenRideIds={drivenRideIds}
+          resolveHeadcount={resolveHeadcount}
+          myPersonId={myPersonId}
+          onEditRide={onEditRide}
+          onDeleteRide={onDeleteRide}
         />
       ))}
 
@@ -610,6 +854,11 @@ const TransportList = memo(function TransportList({
                   dateLocale={dateLocale}
                   isActionsDisabled={isActionsDisabled}
                   isPast={true}
+                  drivenRideIds={drivenRideIds}
+                  resolveHeadcount={resolveHeadcount}
+                  myPersonId={myPersonId}
+                  onEditRide={onEditRide}
+                  onDeleteRide={onDeleteRide}
                 />
               ))}
             </div>
@@ -653,6 +902,11 @@ const TransportListPage = memo(function TransportListPage(): ReactElement {
     error: transportsError,
     deleteTransport,
   } = useTransportContext(),
+   // Same reason as the panel: a driven ride covers its legs. The list also
+   // draws those rides, so it takes the cars along with them — and gates on the
+   // ride load, because a paint before they arrive filters against no cars at
+   // all and flags every ride-covered pickup as driverless.
+   { rides, vehicles, deleteRide, isLoading: isRidesLoading } = useRideContext(),
 
   // Local state
    [transportToDelete, setTransportToDelete] = useState<TransportId | null>(null),
@@ -662,11 +916,24 @@ const TransportListPage = memo(function TransportListPage(): ReactElement {
    [editingTransportId, setEditingTransportId] = useState<TransportId | undefined>(undefined),
    [defaultTransportType, setDefaultTransportType] = useState<TransportType>('arrival'),
 
+  // Dialog state for create/edit ride. Kept apart from the transport dialog
+  // rather than folded into it: a car journey and a guest's own leg are
+  // different rows with different fields, and one dialog switching shape on a
+  // mode flag is how both halves end up half-tested.
+   [isRideDialogOpen, setIsRideDialogOpen] = useState(false),
+   [editingRideId, setEditingRideId] = useState<RideId | undefined>(undefined),
+   [rideToDelete, setRideToDelete] = useState<RideId | null>(null),
+
   // Track if we're currently navigating to prevent double-clicks
    isNavigatingRef = useRef(false),
 
-  // Combined loading state
-   isLoading = isTripLoading || isPersonsLoading || isTransportsLoading,
+  // Combined loading state. The rides are part of it: until they land,
+  // `drivenRideIds` is empty, so a paint taken before that flags every
+  // ride-covered pickup as needing a driver — the contradiction the ids were
+  // added to remove — and the scope filter resolves no cars, hiding the legs
+  // sharing mine.
+   isLoading =
+    isTripLoading || isPersonsLoading || isTransportsLoading || isRidesLoading,
 
   // Get date locale based on current language
    dateLocale = useMemo(() => getDateLocale(i18n.language), [i18n.language]),
@@ -683,51 +950,128 @@ const TransportListPage = memo(function TransportListPage(): ReactElement {
   // Combine arrivals and departures into a single list
    allTransports = useMemo(() => [...arrivals, ...departures], [arrivals, departures]),
 
-  // Separate upcoming and past transports against the context's single
-  // reference instant, so this split and the pickup alerts agree — and so the
-  // list ages on the same minute tick instead of only when something else
-  // happens to re-render it.
-   { upcomingTransports, pastTransports } = useMemo(() => {
-    const upcoming: Transport[] = [];
-    const past: Transport[] = [];
+  // The one read of the journey model. Everything below — which rows exist,
+  // when each is filed, what a card draws — comes from this, so the list, the
+  // map and the notifications cannot disagree about the same car.
+   journeys = useMemo(
+    () => resolveRides({ transports: allTransports, rides, vehicles, persons }),
+    [allTransports, rides, vehicles, persons],
+  ),
 
-    for (const transport of allTransports) {
-      if (isTransportUpcoming(transport.datetime, nowMs)) {
-        upcoming.push(transport);
+  // "Only mine" versus the whole trip's logistics, persisted in `?scope=`.
+  // Shared with the map so the two views can never disagree about which rows
+  // concern the guest holding this device.
+   {
+    scope,
+    canFilter: canFilterScope,
+    myPersonId,
+    visibleTransports,
+    hiddenCount,
+    setScope,
+  } = useTransportScope(allTransports),
+
+  // What the summary above the list counts. Filtered, because "3 arrivals"
+  // over a list showing one is a lie the user has no way to resolve.
+   visibleCounts = useMemo(() => {
+    let arrivalCount = 0,
+      departureCount = 0;
+
+    for (const transport of visibleTransports) {
+      if (transport.type === 'arrival') {
+        arrivalCount += 1;
       } else {
-        past.push(transport);
+        departureCount += 1;
       }
     }
 
-    return { upcomingTransports: upcoming, pastTransports: past };
-  }, [allTransports, nowMs]),
+    return { arrivalCount, departureCount };
+  }, [visibleTransports]),
 
-  // Group upcoming transports by date (chronological)
+  // The trip has travel; none of it is mine. Saying "No travel plans yet" here
+  // would be false, and false in the direction that reads as data loss — the
+  // map says the same thing with the same words.
+   isScopedToNothing =
+    scope === 'mine' && visibleTransports.length === 0 && allTransports.length > 0,
+
+   visibleTransportIds = useMemo(
+    () => new Set(visibleTransports.map((transport) => transport.id)),
+    [visibleTransports],
+  ),
+
+  // The scope filter is applied to the *journeys*, not to the flat leg list.
+  // A car is shown when any leg it carries concerns me, or when I am driving
+  // it — hiding one passenger's leg must not hide the car the other two are
+  // still sitting in, and a ride I drive but have no leg on is still mine.
+   listEntries = useMemo(() => {
+    const entries = buildListEntries(journeys, allTransports);
+
+    if (scope === 'all' || myPersonId === undefined) {
+      return entries;
+    }
+
+    return entries.filter((entry) =>
+      entry.kind === 'ride'
+        ? rideConcernsPerson(entry.journey, myPersonId) ||
+          entry.journey.legs.some((leg) => visibleTransportIds.has(leg.transport.id))
+        : visibleTransportIds.has(entry.transport.id),
+    );
+  }, [journeys, allTransports, scope, visibleTransportIds, myPersonId]),
+
+  // Separate upcoming and past entries against the context's single reference
+  // instant, so this split and the pickup alerts agree — and so the list ages
+  // on the same minute tick instead of only when something else happens to
+  // re-render it. A journey is filed by its meeting time, not by its earliest
+  // leg: the car is what the row is about.
+   { upcomingEntries, pastEntries } = useMemo(() => {
+    const upcoming: TransportListEntry[] = [];
+    const past: TransportListEntry[] = [];
+
+    for (const entry of listEntries) {
+      if (isTransportUpcoming(entry.datetime, nowMs)) {
+        upcoming.push(entry);
+      } else {
+        past.push(entry);
+      }
+    }
+
+    return { upcomingEntries: upcoming, pastEntries: past };
+  }, [listEntries, nowMs]),
+
+  // Group upcoming entries by date (chronological)
    upcomingDateGroups = useMemo(
-    () => groupTransportsByDate(upcomingTransports, dateLocale),
-    [upcomingTransports, dateLocale],
+    () => groupEntriesByDate(upcomingEntries, dateLocale),
+    [upcomingEntries, dateLocale],
   ),
 
-  // Group past transports by date (reverse chronological - most recent first)
+  // Group past entries by date (reverse chronological - most recent first)
    pastDateGroups = useMemo(
-    () => groupTransportsByDate(pastTransports, dateLocale).reverse(),
-    [pastTransports, dateLocale],
+    () => groupEntriesByDate(pastEntries, dateLocale).reverse(),
+    [pastEntries, dateLocale],
   ),
 
-  // Count what the accordion actually renders: `groupTransportsByDate` drops
-  // rows whose datetime cannot be parsed, so counting `pastTransports` promised
-  // more entries than the section could show.
+  // Count what the accordion actually renders: `groupEntriesByDate` drops rows
+  // whose datetime cannot be parsed, so counting `pastEntries` promised more
+  // entries than the section could show.
    pastCount = useMemo(
-    () => pastDateGroups.reduce((total, group) => total + group.transports.length, 0),
+    () => pastDateGroups.reduce((total, group) => total + group.entries.length, 0),
     [pastDateGroups],
   ),
 
   // Amber pickup alerts only when at least one upcoming pickup still needs a
   // driver — same selection the panel counts and the analytics badge reports.
    hasUnassignedUpcomingPickup = useMemo(
-    () => selectPickupsNeedingDriver(upcomingPickups).length > 0,
-    [upcomingPickups],
-  );
+    () => selectPickupsNeedingDriver(upcomingPickups, rides).length > 0,
+    [upcomingPickups, rides],
+  ),
+
+  // Built once for the whole page: every card asks whether somebody is driving
+  // its leg, and the answer must be the same one the alert gate above used.
+   drivenRideIds = useMemo(() => collectDrivenRideIds(rides), [rides]),
+
+  // How many people a guest row stands for. One resolver for the page, so the
+  // ride cards and the capacity chips on them cannot disagree about whether
+  // "Alice+Auré" is one person or two.
+   headcountOf = useMemo(() => createHeadcountResolver(persons), [persons]);
 
   // Sync URL tripId with context - if URL has a tripId but context doesn't match, update context
   useEffect(() => {
@@ -805,6 +1149,74 @@ const TransportListPage = memo(function TransportListPage(): ReactElement {
   }, []),
 
   /**
+   * Opens the ride dialog in create mode.
+   *
+   * A pickup arranged from here starts empty and is filled by the legs that
+   * join it — membership lives on the leg's `rideId`, never on a list held by
+   * the ride, so there is nothing to pick here and nothing to keep in step.
+   */
+   handleAddRide = useCallback(() => {
+    setEditingRideId(undefined);
+    setIsRideDialogOpen(true);
+  }, []),
+
+  /**
+   * Opens one car journey for editing.
+   */
+   handleEditRide = useCallback((rideId: RideId) => {
+    if (isNavigatingRef.current) {return;}
+    setEditingRideId(rideId);
+    setIsRideDialogOpen(true);
+  }, []),
+
+  /**
+   * Opens the confirmation for cancelling a car journey.
+   */
+   handleDeleteRideClick = useCallback((rideId: RideId) => {
+    setRideToDelete(rideId);
+  }, []),
+
+  /**
+   * Cancels the car journey, leaving its passengers' own legs alone.
+   *
+   * `deleteRide` clears the `rideId` of every leg pointing at it, so the guests
+   * keep their arrivals and simply stop being in a car. Deleting their legs too
+   * would throw away the fact that they are still turning up.
+   */
+   handleConfirmDeleteRide = useCallback(async () => {
+    if (!rideToDelete) {return;}
+
+    try {
+      await deleteRide(rideToDelete);
+      setRideToDelete(null);
+      successToast(t('rides.deleteSuccess'));
+    } catch (error) {
+      console.error('Failed to delete ride:', error);
+      toast.error(t('errors.deleteFailed', 'Failed to delete'));
+      throw error; // Re-thrown so the dialog stays open for a retry
+    }
+  }, [rideToDelete, deleteRide, t, successToast]),
+
+  /**
+   * Closes the ride delete confirmation.
+   */
+   handleCancelDeleteRide = useCallback((open: boolean) => {
+    if (!open) {
+      setRideToDelete(null);
+    }
+  }, []),
+
+  /**
+   * Closes the ride dialog and forgets what was being edited.
+   */
+   handleRideDialogOpenChange = useCallback((open: boolean) => {
+    setIsRideDialogOpen(open);
+    if (!open) {
+      setEditingRideId(undefined);
+    }
+  }, []),
+
+  /**
    * Handles back navigation.
    */
    handleBack = useCallback(() => {
@@ -816,6 +1228,17 @@ const TransportListPage = memo(function TransportListPage(): ReactElement {
    */
    handleOpenMap = useCallback(() => {
     navigate(`/trips/${tripIdFromUrl}/transports/map`);
+  }, [navigate, tripIdFromUrl]),
+
+  /**
+   * Handles navigation to the trip's cars.
+   *
+   * This button is the only way in. The cars are not in the main navigation:
+   * a car exists to be picked on a ride, and nobody sets out to manage one for
+   * its own sake, so it lives under the transport list that uses it.
+   */
+   handleOpenCars = useCallback(() => {
+    navigate(`/trips/${tripIdFromUrl}/transports/vehicles`);
   }, [navigate, tripIdFromUrl]),
 
   /**
@@ -834,18 +1257,37 @@ const TransportListPage = memo(function TransportListPage(): ReactElement {
 
    headerAction = useMemo(
     () => (
-      <div className="hidden sm:flex items-center gap-2">
-        <Button variant="outline" onClick={handleOpenMap}>
-          <MapIcon className="size-4 mr-2" aria-hidden="true" />
-          {t('transports.mapView', 'Map view')}
+      /*
+        Four controls, and only one of them is hidden on a phone.
+
+        "New transport" stays desktop-only because the FAB below already is
+        that button on a small screen, and two of the same control is worse
+        than none. The other three have no mobile equivalent at all, so they
+        drop their labels rather than themselves — "Cars" in particular is the
+        single way into a page that is deliberately not in the navigation.
+      */
+      <div className="flex flex-wrap items-center justify-end gap-2">
+        <Button variant="outline" onClick={handleOpenCars}>
+          <CarFront className="size-4 sm:mr-2" aria-hidden="true" />
+          <span className="sr-only sm:not-sr-only">{t('vehicles.title')}</span>
         </Button>
-        <Button onClick={handleAddTransport}>
+        <Button variant="outline" onClick={handleOpenMap}>
+          <MapIcon className="size-4 sm:mr-2" aria-hidden="true" />
+          <span className="sr-only sm:not-sr-only">
+            {t('transports.mapView', 'Map view')}
+          </span>
+        </Button>
+        <Button variant="outline" onClick={handleAddRide}>
+          <Plus className="size-4 mr-2" aria-hidden="true" />
+          {t('rides.new')}
+        </Button>
+        <Button className="hidden sm:inline-flex" onClick={handleAddTransport}>
           <Plus className="size-4 mr-2" aria-hidden="true" />
           {t('transports.new')}
         </Button>
       </div>
     ),
-    [handleAddTransport, handleOpenMap, t],
+    [handleAddRide, handleAddTransport, handleOpenCars, handleOpenMap, t],
   );
 
   // ============================================================================
@@ -924,6 +1366,14 @@ const TransportListPage = memo(function TransportListPage(): ReactElement {
         action={headerAction}
       />
 
+      {/* Whose travel this page is showing, and what that is hiding */}
+      <TransportScopeFilter
+        scope={scope}
+        canFilter={canFilterScope}
+        hiddenCount={hiddenCount}
+        onScopeChange={setScope}
+      />
+
       {/* Transport count summary */}
       {allTransports.length > 0 && (
         <div className="flex items-center gap-4 mb-6 text-sm text-muted-foreground">
@@ -934,7 +1384,7 @@ const TransportListPage = memo(function TransportListPage(): ReactElement {
             />
             <span>
               {t('transports.arrivalsCount', {
-                count: arrivals.length,
+                count: visibleCounts.arrivalCount,
                 defaultValue_one: '{{count}} arrival',
                 defaultValue_other: '{{count}} arrivals',
               })}
@@ -947,7 +1397,7 @@ const TransportListPage = memo(function TransportListPage(): ReactElement {
             />
             <span>
               {t('transports.departuresCount', {
-                count: departures.length,
+                count: visibleCounts.departureCount,
                 defaultValue_one: '{{count}} departure',
                 defaultValue_other: '{{count}} departures',
               })}
@@ -955,6 +1405,26 @@ const TransportListPage = memo(function TransportListPage(): ReactElement {
           </div>
         </div>
       )}
+
+      {/*
+        Three bands of news, in the order a driver has to read them.
+
+        What *moved* comes first. "Leave now" is computed from a meeting time,
+        and a driver who reads the banner before the feed leaves for a pickup
+        that has since been pushed to 19:00. Then the driver's own departure
+        banner — a car this device is already driving is news. Then the panel
+        below, which asks for volunteers: a car still looking for anybody has
+        been looking all along, so it is a request rather than news.
+
+        Both render nothing when they have nothing to say, so on most visits
+        this costs two empty nodes.
+
+        In the page flow rather than fixed: a fixed overlay eats every tap
+        underneath it, and the nav bar, the FAB and the toasts already share
+        the bottom edge.
+      */}
+      <RideChangeFeed className="mb-6" />
+      <DriverAlert className="mb-6" />
 
       {/* Pickup alerts section - only when a driver is still needed */}
       {hasUnassignedUpcomingPickup && (
@@ -978,8 +1448,17 @@ const TransportListPage = memo(function TransportListPage(): ReactElement {
         onDelete={handleDeleteClick}
         dateLocale={dateLocale}
         listLabel={t('transports.title')}
-        emptyTitle={t('transports.empty')}
-        emptyDescription={t('transports.emptyDescription')}
+        emptyTitle={isScopedToNothing ? t('transports.scope.empty') : t('transports.empty')}
+        emptyDescription={
+          isScopedToNothing
+            ? t('transports.scope.emptyDescription')
+            : t('transports.emptyDescription')
+        }
+        drivenRideIds={drivenRideIds}
+        resolveHeadcount={headcountOf}
+        myPersonId={myPersonId}
+        onEditRide={handleEditRide}
+        onDeleteRide={handleDeleteRideClick}
       />
 
       {/* Floating Action Button for mobile */}
@@ -1006,6 +1485,24 @@ const TransportListPage = memo(function TransportListPage(): ReactElement {
         confirmLabel={t('common.delete')}
         variant="destructive"
         onConfirm={handleConfirmDelete}
+      />
+
+      {/* Ride Cancel Confirmation Dialog */}
+      <ConfirmDialog
+        open={rideToDelete !== null}
+        onOpenChange={handleCancelDeleteRide}
+        title={t('confirm.deleteRide')}
+        description={t('confirm.deleteRideDescription')}
+        confirmLabel={t('common.delete')}
+        variant="destructive"
+        onConfirm={handleConfirmDeleteRide}
+      />
+
+      {/* Ride Create/Edit Dialog */}
+      <RideDialog
+        rideId={editingRideId}
+        open={isRideDialogOpen}
+        onOpenChange={handleRideDialogOpenChange}
       />
 
       {/* Transport Create/Edit Dialog */}

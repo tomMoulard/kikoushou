@@ -31,8 +31,60 @@ export type { TransportFormProps } from './components/TransportForm';
 export { TransportDialog } from './components/TransportDialog';
 export type { TransportDialogProps } from './components/TransportDialog';
 
+export { RideForm } from './components/RideForm';
+export type { RideFormProps } from './components/RideForm';
+
+export { RideDialog } from './components/RideDialog';
+export type { RideDialogProps } from './components/RideDialog';
+
 export { UpcomingPickups } from './components/UpcomingPickups';
 export type { UpcomingPickupsProps } from './components/UpcomingPickups';
+
+export { RideCard } from './components/RideCard';
+export type { RideCardProps } from './components/RideCard';
+
+export { RideCapacityBadge } from './components/RideCapacityBadge';
+export type { RideCapacityBadgeProps } from './components/RideCapacityBadge';
+
+export { RideMismatchNotice } from './components/RideMismatchNotice';
+export type { RideMismatchNoticeProps } from './components/RideMismatchNotice';
+
+// The one rendering of a car journey, shared by the calendar's detail dialog
+// and the map's meeting-point popup so the two cannot show different subsets of
+// the same facts.
+export { RideSummary } from './components/RideSummary';
+export type {
+  RideSummaryDensity,
+  RideSummaryProps,
+} from './components/RideSummary';
+
+export { RideChangeFeed } from './components/RideChangeFeed';
+export type { RideChangeFeedProps } from './components/RideChangeFeed';
+
+export { TransportScopeFilter } from './components/TransportScopeFilter';
+export type { TransportScopeFilterProps } from './components/TransportScopeFilter';
+
+export { DriverAlert } from './components/DriverAlert';
+export type {
+  DriverAlertProps,
+  RideDepartureAnnouncement,
+} from './components/DriverAlert';
+
+// ============================================================================
+// Hooks
+// ============================================================================
+
+// The detection half of "Alice moved her pickup": one device's watermark
+// against the document's current times. Exported because the same signal feeds
+// more than the feed that renders it.
+export { useRideChanges } from './hooks/useRideChanges';
+export type {
+  RideChange,
+  UseRideChangesResult,
+} from './hooks/useRideChanges';
+
+export { useTransportScope } from './hooks/useTransportScope';
+export type { UseTransportScopeResult } from './hooks/useTransportScope';
 
 // ============================================================================
 // Utilities
@@ -47,6 +99,40 @@ export {
   sortTransportsByInstant,
   toTransportInstant,
 } from './utils/pickup-utils';
+
+// One summary and one predicate, so a badge, a card and a form cannot disagree
+// about whether a car is overloaded. `hasCapacityWarning` is the only question
+// worth colouring: being exactly full is a correctly loaded car.
+export {
+  hasCapacityWarning,
+  summariseRideCapacity,
+} from './utils/ride-capacity';
+export type {
+  ChildSeatShortfall,
+  ChildSeatTally,
+  RideCapacitySummary,
+} from './utils/ride-capacity';
+
+// "Does this concern me?" — the one definition both transport views filter by.
+export {
+  parseTransportScope,
+  selectTransportsConcerning,
+  TRANSPORT_SCOPE_PARAM,
+  type TransportScope,
+} from './utils/transport-scope';
+
+// When the driver has to set off, and whether that is worth saying yet.
+export {
+  classifyRideDeparture,
+  selectRideDepartures,
+  LATE_GRACE_MINUTES,
+  RIDE_DEPARTURE_STATUSES,
+  UPCOMING_HORIZON_MINUTES,
+} from './utils/ride-departure';
+export type {
+  RideDeparture,
+  RideDepartureStatus,
+} from './utils/ride-departure';
 
 // ============================================================================
 // Routes
